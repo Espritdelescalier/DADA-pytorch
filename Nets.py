@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torch.nn.utils.weight_norm as Weight_norm
 import numpy as np
 import plotting
+import matplotlib.pyplot as plt
 
 
 class _G(nn.Module):
@@ -110,7 +111,7 @@ class _D(nn.Module):
 
 
 class Train(object):
-    def __init__(self, G, D, G_optim, D_optim, num_classes):
+    def __init__(self, G, D, G_optim, D_optim, num_classes, latent_dim):
         self.G = G
         self.D = D
         self.G_optim = G_optim
@@ -118,13 +119,14 @@ class Train(object):
         self.loss = nn.CrossEntropyLoss()
         self.noise = torch.randn(100, 100)
         self.num = num_classes
+        self.latent_dim = latent_dim
 
     def log_sum_exp(self, x, axis=1):
         m = torch.max(x, dim=1)[0]
         return torch.log(torch.sum(torch.exp(x - m.unsqueeze(1)), dim=axis))+m
 
-    def train_batch_disc(self, x, y, gen_y, weight_gen_loss):
-        noise = torch.randn(y.shape[0], 100)
+    def train_batch_disc(self, x, y, gen_y, weight_gen_loss, fone):
+        noise = torch.randn(y.shape[0], self.latent_dim)
         if torch.cuda.is_available():
             noise = noise.cuda()
             x = x.cuda()
@@ -135,7 +137,7 @@ class Train(object):
         self.G.train()
 
         lab = self.D(x)
-        gen = self.G(noise, gen_y)
+        gen = self.G(noise, F.one_hot(gen_y, self.num).float().cuda())
         gen_data = self.D(gen)
 
         # (batch,2,self.num) ---< (batch,2)
@@ -144,7 +146,7 @@ class Train(object):
         source_gen = torch.matmul(torch.reshape(gen_data, (gen_y.shape[0], 2, self.num)), F.one_hot(
             gen_y, self.num).unsqueeze(-1).float().cuda()).squeeze()
         # real and fake class loss
-        #loss_source_gen = self.loss(source_gen,torch.zeros(gen_y.shape[0]))
+        # loss_source_gen = self.loss(source_gen,torch.zeros(gen_y.shape[0]))
         loss_source_lab = self.loss(source_lab, torch.zeros(y.shape[0]).long(
         ).cuda())+self.loss(source_gen, torch.ones(y.shape[0]).long().cuda())
 
@@ -161,14 +163,17 @@ class Train(object):
         loss_lab = (1-weight_gen_loss)*loss_source_lab + \
             weight_gen_loss*(loss_class_lab+loss_class_gen)
         # acc
-        acc = torch.mean((class_lab.max(1)[1] == y).float())
+        out_class = torch.topk(class_lab, 1, dim=1).indices.flatten()
+        acc = torch.mean(
+            (out_class == y).float())
+        fone.update(out_class, y)
         self.D_optim.zero_grad()
         loss_lab.backward()
         self.D_optim.step()
-        return loss_lab.item(), acc.item()
+        return loss_lab.item(), acc.item(), fone
 
     def train_batch_gen(self, x, gen_y, weight_gen_loss):
-        noise = torch.randn(gen_y.shape[0], 100)
+        noise = torch.randn(gen_y.shape[0], self.latent_dim)
         if torch.cuda.is_available():
             noise = noise.cuda()
             x = x.cuda()
@@ -176,14 +181,14 @@ class Train(object):
         self.D.train()
         self.G.train()
 
-        gen = self.G(noise, gen_y)
+        gen = self.G(noise, F.one_hot(gen_y, self.num).float().cuda())
         gen_data = self.D(gen)
 
-        output_x = self.D(x, feature=True)
-        output_gen = self.D(gen, feature=True)
+        output_x = self.D(x)  # self.D(x, True)
+        output_gen = self.D(gen)  # self.D(gen, True)
         # gen loss
         source_gen = torch.matmul(torch.reshape(gen_data, (gen_y.shape[0], 2, self.num)), F.one_hot(
-            gen_y, self.num).float().cuda().unsqueeze(-1)).squeeze()
+            gen_y, self.num).float().cuda().unsqueeze(-1)).squeeze(2)
         loss_source_gen = self.loss(
             source_gen, torch.zeros(gen_y.shape[0]).long().cuda())
         # feature loss
@@ -198,7 +203,7 @@ class Train(object):
         self.G_optim.step()
         return total_loss.item()
 
-    def test(self, x, y):
+    def test(self, x, y, fone):
         self.D.eval()
         self.G.eval()
         with torch.no_grad():
@@ -206,9 +211,12 @@ class Train(object):
                 x, y = x.cuda(), y.cuda()
             output = self.D(x)
             output = torch.matmul(torch.reshape(output, (y.shape[0], 2, self.num)).permute(
-                0, 2, 1), torch.ones(y.shape[0], 2, 1).cuda()).squeeze()
-            acc = torch.mean((output.max(1)[1] == y).float())
-        return acc.item()
+                0, 2, 1), torch.ones(y.shape[0], 2, 1).cuda()).squeeze(2)
+            out_class = torch.topk(output, 1, dim=1).indices.flatten()
+            acc = torch.mean(
+                (out_class == y).float())
+            fone.update(out_class, y)
+        return acc.item(), fone
 
     def save_png(self, save_dir, epoch):
         y = torch.from_numpy(
@@ -226,3 +234,35 @@ class Train(object):
             img_tile, title='CIFAR10 samples '+str(epoch)+" epochs")
         plotting.plt.savefig(
             save_dir+"cifar_sample_feature_match_"+str(epoch)+".png")
+
+    def save_img(self,
+                 save_dir,
+                 epoch,
+                 target_length,
+                 sequence_size,
+                 num_classes):
+        fig, ax_num = plt.subplots(sequence_size//target_length)
+        print(
+            f"target_length, {target_length}, sequence size, {sequence_size}")
+        cls_input = torch.from_numpy(
+            np.int32(np.repeat(np.arange(num_classes).reshape(num_classes, 1), num_classes, axis=1))).reshape(num_classes*2, 1)
+        noise = torch.randn(2*num_classes, self.latent_dim)
+        print(
+            f"npise, {noise.shape}, class input, {cls_input.shape}")
+        if torch.cuda.is_available():
+            noise = noise.cuda()
+            cls_input = cls_input.long().cuda()
+        with torch.no_grad():
+            gen_data = self.G(noise, F.one_hot(
+                cls_input, num_classes).squeeze().float().cuda())
+            gen_data = gen_data.cpu().detach().numpy()
+        for i in range(gen_data.shape[0]):
+            # fig, ax_num = plt.subplots(sequence_size//target_length)
+            for j in range(sequence_size//target_length):
+                ax_num[j].plot(
+                    gen_data.squeeze()[i, j*target_length:(j*target_length)+target_length])
+            plt.savefig(save_dir+"sequences_example_epoch"+str(epoch) +
+                        "_class_"+str(cls_input[i].item())+"_num_"+str(i)+".png")
+            for j in range(sequence_size//target_length):
+                ax_num[j].cla()
+        plt.close('all')

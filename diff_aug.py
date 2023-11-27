@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import random
-from models_search.ada import *
+from ada import *
 # from models_search import conv2d_gradfix
 import scipy.signal
 from torch_utils import persistence
@@ -12,7 +12,7 @@ from torch_utils import misc
 from torch_utils.ops import upfirdn2d
 from torch_utils.ops import grid_sample_gradfix
 from torch_utils.ops import conv2d_gradfix
-    
+
 wavelets = {
     'haar': [0.7071067811865476, 0.7071067811865476],
     'db1':  [0.7071067811865476, 0.7071067811865476],
@@ -57,70 +57,88 @@ def DiffAugment(x, policy='', channels_first=True, affine=None):
         x = x.contiguous()
     return x
 
+
 def rand_crop(x, affine=None):
     b, _, h, w = x.shape
-    x_large = torch.nn.functional.interpolate(x, scale_factor=1.2, mode='bicubic')
+    x_large = torch.nn.functional.interpolate(
+        x, scale_factor=1.2, mode='bicubic')
     _, _, h_large, w_large = x_large.size()
-    h_start, w_start = random.randint(0, (h_large - h)), random.randint(0, (w_large - w))
+    h_start, w_start = random.randint(
+        0, (h_large - h)), random.randint(0, (w_large - w))
     x_crop = x_large[:, :, h_start:h_start+h, w_start:w_start+w]
     assert x_crop.size() == x.size()
-    output = torch.where(torch.rand([b, 1, 1, 1], device=x.device) < 0.2, x_crop, x)
+    output = torch.where(torch.rand(
+        [b, 1, 1, 1], device=x.device) < 0.2, x_crop, x)
     return output
-    
+
 
 def rand_filter(images, affine=None):
     ratio = 0.25
-   
-    
+
     _, Hz_fbank = affine
     Hz_fbank = Hz_fbank.to(images.device)
-    imgfilter_bands = [1,1,1,1]
+    imgfilter_bands = [1, 1, 1, 1]
     batch_size, num_channels, height, width = images.shape
     device = images.device
     num_bands = Hz_fbank.shape[0]
-    assert len([1,1,1,1]) == num_bands
-    expected_power = constant(np.array([10, 1, 1, 1]) / 13, device=device) # Expected power spectrum (1/f).
+    assert len([1, 1, 1, 1]) == num_bands
+    # Expected power spectrum (1/f).
+    expected_power = constant(np.array([10, 1, 1, 1]) / 13, device=device)
 
     # Apply amplification for each band with probability (imgfilter * strength * band_strength).
-    g = torch.ones([batch_size, num_bands], device=device) # Global gain vector (identity).
+    # Global gain vector (identity).
+    g = torch.ones([batch_size, num_bands], device=device)
     for i, band_strength in enumerate(imgfilter_bands):
         t_i = torch.exp2(torch.randn([batch_size], device=device) * 1)
-        t_i = torch.where(torch.rand([batch_size], device=device) < ratio * band_strength, t_i, torch.ones_like(t_i))
+        t_i = torch.where(torch.rand(
+            [batch_size], device=device) < ratio * band_strength, t_i, torch.ones_like(t_i))
 #         if debug_percentile is not None:
 #             t_i = torch.full_like(t_i, torch.exp2(torch.erfinv(debug_percentile * 2 - 1) * 1)) if band_strength > 0 else torch.ones_like(t_i)
-        t = torch.ones([batch_size, num_bands], device=device)                  # Temporary gain vector.
-        t[:, i] = t_i                                                           # Replace i'th element.
-        t = t / (expected_power * t.square()).sum(dim=-1, keepdims=True).sqrt() # Normalize power.
-        g = g * t                                                               # Accumulate into global gain.
+        # Temporary gain vector.
+        t = torch.ones([batch_size, num_bands], device=device)
+        # Replace i'th element.
+        t[:, i] = t_i
+        # Normalize power.
+        t = t / (expected_power * t.square()).sum(dim=-1, keepdims=True).sqrt()
+        # Accumulate into global gain.
+        g = g * t
 
     # Construct combined amplification filter.
     Hz_prime = g @ Hz_fbank                                    # [batch, tap]
-    Hz_prime = Hz_prime.unsqueeze(1).repeat([1, num_channels, 1])   # [batch, channels, tap]
-    Hz_prime = Hz_prime.reshape([batch_size * num_channels, 1, -1]) # [batch * channels, 1, tap]
+    Hz_prime = Hz_prime.unsqueeze(1).repeat(
+        [1, num_channels, 1])   # [batch, channels, tap]
+    # [batch * channels, 1, tap]
+    Hz_prime = Hz_prime.reshape([batch_size * num_channels, 1, -1])
 
     # Apply filter.
     p = Hz_fbank.shape[1] // 2
     images = images.reshape([1, batch_size * num_channels, height, width])
-    images = torch.nn.functional.pad(input=images, pad=[p,p,p,p], mode='reflect')
-    images = conv2d_gradfix.conv2d(input=images, weight=Hz_prime.unsqueeze(2), groups=batch_size*num_channels)
-    images = conv2d_gradfix.conv2d(input=images, weight=Hz_prime.unsqueeze(3), groups=batch_size*num_channels)
+    images = torch.nn.functional.pad(
+        input=images, pad=[p, p, p, p], mode='reflect')
+    images = conv2d_gradfix.conv2d(
+        input=images, weight=Hz_prime.unsqueeze(2), groups=batch_size*num_channels)
+    images = conv2d_gradfix.conv2d(
+        input=images, weight=Hz_prime.unsqueeze(3), groups=batch_size*num_channels)
     images = images.reshape([batch_size, num_channels, height, width])
     return images
-            
+
+
 def rand_hue(images, affine=None):
     batch_size, num_channels, height, width = images.shape
     device = images.device
     I_4 = torch.eye(4, device=device)
     C = I_4
-    v = constant(np.asarray([1, 1, 1, 0]) / np.sqrt(3), device=device) # Luma axis.
+    # Luma axis.
+    v = constant(np.asarray([1, 1, 1, 0]) / np.sqrt(3), device=device)
 
     # Apply hue rotation with probability (hue * strength).
     if num_channels > 1:
         theta = (torch.rand([batch_size], device=device) * 2 - 1) * np.pi * 1
-        theta = torch.where(torch.rand([batch_size], device=device) < 0.5, theta, torch.zeros_like(theta))
+        theta = torch.where(torch.rand(
+            [batch_size], device=device) < 0.5, theta, torch.zeros_like(theta))
 #         if debug_percentile is not None:
 #             theta = torch.full_like(theta, (debug_percentile * 2 - 1) * np.pi * 1)
-        C = rotate3d(v, theta) @ C # Rotate around v.
+        C = rotate3d(v, theta) @ C  # Rotate around v.
 
     # Apply saturation with probability (saturation * strength).
 #     if self.saturation > 0 and num_channels > 1:
@@ -141,26 +159,29 @@ def rand_hue(images, affine=None):
             images = C[:, :3, :3] @ images + C[:, :3, 3:]
         elif num_channels == 1:
             C = C[:, :3, :].mean(dim=1, keepdims=True)
-            images = images * C[:, :, :3].sum(dim=2, keepdims=True) + C[:, :, 3:]
+            images = images * \
+                C[:, :, :3].sum(dim=2, keepdims=True) + C[:, :, 3:]
         else:
             raise ValueError('Image must be RGB (3 channels) or L (1 channel)')
         images = images.reshape([batch_size, num_channels, height, width])
     return images
 
+
 def rand_geo(images, affine=None):
     batch_size, num_channels, height, width = images.shape
     device = images.device
-    
+
     Hz_geom, _ = affine
     Hz_geom = Hz_geom.to(images.device)
-    
+
     I_3 = torch.eye(3, device=device)
     G_inv = I_3
 
     # Apply x-flip with probability (xflip * strength).
     if 1:
         i = torch.floor(torch.rand([batch_size], device=device) * 2)
-        i = torch.where(torch.rand([batch_size], device=device) < 1, i, torch.zeros_like(i))
+        i = torch.where(torch.rand(
+            [batch_size], device=device) < 1, i, torch.zeros_like(i))
 #         if debug_percentile is not None:
 #             i = torch.full_like(i, torch.floor(debug_percentile * 2))
         G_inv = G_inv @ scale2d_inv(1 - 2 * i, 1)
@@ -188,7 +209,8 @@ def rand_geo(images, affine=None):
     # Apply isotropic scaling with probability (scale * strength).
     if 1:
         s = torch.exp2(torch.randn([batch_size], device=device) * 0.2)
-        s = torch.where(torch.rand([batch_size], device=device) < 0.3, s, torch.ones_like(s))
+        s = torch.where(torch.rand(
+            [batch_size], device=device) < 0.3, s, torch.ones_like(s))
 #         if debug_percentile is not None:
 #             s = torch.full_like(s, torch.exp2(torch.erfinv(debug_percentile * 2 - 1) * self.scale_std))
         G_inv = G_inv @ scale2d_inv(s, s)
@@ -205,7 +227,8 @@ def rand_geo(images, affine=None):
 #     Apply anisotropic scaling with probability (aniso * strength).
     if 1:
         s = torch.exp2(torch.randn([batch_size], device=device) * 0.2)
-        s = torch.where(torch.rand([batch_size], device=device) < 0.3, s, torch.ones_like(s))
+        s = torch.where(torch.rand(
+            [batch_size], device=device) < 0.3, s, torch.ones_like(s))
 #         if debug_percentile is not None:
 #             s = torch.full_like(s, torch.exp2(torch.erfinv(debug_percentile * 2 - 1) * self.aniso_std))
         G_inv = G_inv @ scale2d_inv(s, 1 / s)
@@ -221,10 +244,11 @@ def rand_geo(images, affine=None):
     # Apply fractional translation with probability (xfrac * strength).
     if 1:
         t = torch.randn([batch_size, 2], device=device) * 0.125
-        t = torch.where(torch.rand([batch_size, 1], device=device) < 0.3, t, torch.zeros_like(t))
+        t = torch.where(torch.rand(
+            [batch_size, 1], device=device) < 0.3, t, torch.zeros_like(t))
 #         if debug_percentile is not None:
 #             t = torch.full_like(t, torch.erfinv(debug_percentile * 2 - 1) * 0.125)
-        G_inv = G_inv @ translate2d_inv(t[:,0] * width, t[:,1] * height)
+        G_inv = G_inv @ translate2d_inv(t[:, 0] * width, t[:, 1] * height)
 
     # ----------------------------------
     # Execute geometric transformations.
@@ -236,36 +260,44 @@ def rand_geo(images, affine=None):
         # Calculate padding.
         cx = (width - 1) / 2
         cy = (height - 1) / 2
-        cp = matrix([-cx, -cy, 1], [cx, -cy, 1], [cx, cy, 1], [-cx, cy, 1], device=device) # [idx, xyz]
-        cp = G_inv @ cp.t() # [batch, xyz, idx]
+        cp = matrix([-cx, -cy, 1], [cx, -cy, 1], [cx, cy, 1],
+                    [-cx, cy, 1], device=device)  # [idx, xyz]
+        cp = G_inv @ cp.t()  # [batch, xyz, idx]
         Hz_pad = Hz_geom.shape[0] // 4
-        margin = cp[:, :2, :].permute(1, 0, 2).flatten(1) # [xy, batch * idx]
-        margin = torch.cat([-margin, margin]).max(dim=1).values # [x0, y0, x1, y1]
-        margin = margin + constant([Hz_pad * 2 - cx, Hz_pad * 2 - cy] * 2, device=device)
+        margin = cp[:, :2, :].permute(1, 0, 2).flatten(1)  # [xy, batch * idx]
+        # [x0, y0, x1, y1]
+        margin = torch.cat([-margin, margin]).max(dim=1).values
+        margin = margin + \
+            constant([Hz_pad * 2 - cx, Hz_pad * 2 - cy] * 2, device=device)
         margin = margin.max(constant([0, 0] * 2, device=device))
         margin = margin.min(constant([width-1, height-1] * 2, device=device))
         mx0, my0, mx1, my1 = margin.ceil().to(torch.int32)
 
         # Pad image and adjust origin.
-        images = torch.nn.functional.pad(input=images, pad=[mx0,mx1,my0,my1], mode='reflect')
+        images = torch.nn.functional.pad(
+            input=images, pad=[mx0, mx1, my0, my1], mode='reflect')
         G_inv = translate2d((mx0 - mx1) / 2, (my0 - my1) / 2) @ G_inv
 
         # Upsample.
         images = upfirdn2d.upsample2d(x=images, f=Hz_geom, up=2)
-        G_inv = scale2d(2, 2, device=device) @ G_inv @ scale2d_inv(2, 2, device=device)
-        G_inv = translate2d(-0.5, -0.5, device=device) @ G_inv @ translate2d_inv(-0.5, -0.5, device=device)
+        G_inv = scale2d(
+            2, 2, device=device) @ G_inv @ scale2d_inv(2, 2, device=device)
+        G_inv = translate2d(-0.5, -0.5,
+                            device=device) @ G_inv @ translate2d_inv(-0.5, -0.5, device=device)
 
         # Execute transformation.
-        shape = [batch_size, num_channels, (height + Hz_pad * 2) * 2, (width + Hz_pad * 2) * 2]
-        G_inv = scale2d(2 / images.shape[3], 2 / images.shape[2], device=device) @ G_inv @ scale2d_inv(2 / shape[3], 2 / shape[2], device=device)
-        grid = torch.nn.functional.affine_grid(theta=G_inv[:,:2,:], size=shape, align_corners=False)
+        shape = [batch_size, num_channels,
+                 (height + Hz_pad * 2) * 2, (width + Hz_pad * 2) * 2]
+        G_inv = scale2d(2 / images.shape[3], 2 / images.shape[2], device=device) @ G_inv @ scale2d_inv(
+            2 / shape[3], 2 / shape[2], device=device)
+        grid = torch.nn.functional.affine_grid(
+            theta=G_inv[:, :2, :], size=shape, align_corners=False)
         images = grid_sample_gradfix.grid_sample(images, grid)
 
         # Downsample and crop.
-        images = upfirdn2d.downsample2d(x=images, f=Hz_geom, down=2, padding=-Hz_pad*2, flip_filter=True)
+        images = upfirdn2d.downsample2d(
+            x=images, f=Hz_geom, down=2, padding=-Hz_pad*2, flip_filter=True)
     return images
-
-
 
 
 def rand_brightness(x, affine=None):
@@ -275,20 +307,25 @@ def rand_brightness(x, affine=None):
 
 def rand_saturation(x, affine=None):
     x_mean = x.mean(dim=1, keepdim=True)
-    x = (x - x_mean) * (torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) * 2) + x_mean
+    x = (x - x_mean) * (torch.rand(x.size(0), 1, 1, 1,
+                                   dtype=x.dtype, device=x.device) * 2) + x_mean
     return x
 
 
 def rand_contrast(x, affine=None):
     x_mean = x.mean(dim=[1, 2, 3], keepdim=True)
-    x = (x - x_mean) * (torch.rand(x.size(0), 1, 1, 1, dtype=x.dtype, device=x.device) + 0.5) + x_mean
+    x = (x - x_mean) * (torch.rand(x.size(0), 1, 1, 1,
+                                   dtype=x.dtype, device=x.device) + 0.5) + x_mean
     return x
 
 
 def rand_translation(x, ratio=0.2, affine=None):
-    shift_x, shift_y = int(x.size(2) * ratio + 0.5), int(x.size(3) * ratio + 0.5)
-    translation_x = torch.randint(-shift_x, shift_x + 1, size=[x.size(0), 1, 1], device=x.device)
-    translation_y = torch.randint(-shift_y, shift_y + 1, size=[x.size(0), 1, 1], device=x.device)
+    shift_x, shift_y = int(x.size(2) * ratio +
+                           0.5), int(x.size(3) * ratio + 0.5)
+    translation_x = torch.randint(-shift_x, shift_x + 1,
+                                  size=[x.size(0), 1, 1], device=x.device)
+    translation_y = torch.randint(-shift_y, shift_y + 1,
+                                  size=[x.size(0), 1, 1], device=x.device)
     grid_batch, grid_x, grid_y = torch.meshgrid(
         torch.arange(x.size(0), dtype=torch.long, device=x.device),
         torch.arange(x.size(2), dtype=torch.long, device=x.device),
@@ -297,13 +334,18 @@ def rand_translation(x, ratio=0.2, affine=None):
     grid_x = torch.clamp(grid_x + translation_x + 1, 0, x.size(2) + 1)
     grid_y = torch.clamp(grid_y + translation_y + 1, 0, x.size(3) + 1)
     x_pad = F.pad(x, [1, 1, 1, 1, 0, 0, 0, 0])
-    x = x_pad.permute(0, 2, 3, 1).contiguous()[grid_batch, grid_x, grid_y].permute(0, 3, 1, 2)
+    x = x_pad.permute(0, 2, 3, 1).contiguous()[
+        grid_batch, grid_x, grid_y].permute(0, 3, 1, 2)
     return x
 
+
 def rand_translation_1(x, ratio=0.1, affine=None):
-    shift_x, shift_y = int(x.size(2) * ratio + 0.5), int(x.size(3) * ratio + 0.5)
-    translation_x = torch.randint(-shift_x, shift_x + 1, size=[x.size(0), 1, 1], device=x.device)
-    translation_y = torch.randint(-shift_y, shift_y + 1, size=[x.size(0), 1, 1], device=x.device)
+    shift_x, shift_y = int(x.size(2) * ratio +
+                           0.5), int(x.size(3) * ratio + 0.5)
+    translation_x = torch.randint(-shift_x, shift_x + 1,
+                                  size=[x.size(0), 1, 1], device=x.device)
+    translation_y = torch.randint(-shift_y, shift_y + 1,
+                                  size=[x.size(0), 1, 1], device=x.device)
     translation_x = translation_x*2 - 1
     translation_y = translation_y*2 - 1
     grid_batch, grid_x, grid_y = torch.meshgrid(
@@ -314,14 +356,19 @@ def rand_translation_1(x, ratio=0.1, affine=None):
     grid_x = torch.clamp(grid_x + translation_x + 1, 0, x.size(2) + 1)
     grid_y = torch.clamp(grid_y + translation_y + 1, 0, x.size(3) + 1)
     x_pad = F.pad(x, [1, 1, 1, 1, 0, 0, 0, 0])
-    x = x_pad.permute(0, 2, 3, 1).contiguous()[grid_batch, grid_x, grid_y].permute(0, 3, 1, 2)
+    x = x_pad.permute(0, 2, 3, 1).contiguous()[
+        grid_batch, grid_x, grid_y].permute(0, 3, 1, 2)
     return x
+
 
 def rand_strong_translation(x, ratio=0.125, affine=None):
     ratio = 0.125
-    shift_x, shift_y = int(x.size(2) * ratio + 0.5), int(x.size(3) * ratio + 0.5)
-    translation_x = torch.randint(-shift_x, shift_x + 1, size=[x.size(0), 1, 1], device=x.device)
-    translation_y = torch.randint(-shift_y, shift_y + 1, size=[x.size(0), 1, 1], device=x.device)
+    shift_x, shift_y = int(x.size(2) * ratio +
+                           0.5), int(x.size(3) * ratio + 0.5)
+    translation_x = torch.randint(-shift_x, shift_x + 1,
+                                  size=[x.size(0), 1, 1], device=x.device)
+    translation_y = torch.randint(-shift_y, shift_y + 1,
+                                  size=[x.size(0), 1, 1], device=x.device)
     grid_batch, grid_x, grid_y = torch.meshgrid(
         torch.arange(x.size(0), dtype=torch.long, device=x.device),
         torch.arange(x.size(2), dtype=torch.long, device=x.device),
@@ -330,25 +377,32 @@ def rand_strong_translation(x, ratio=0.125, affine=None):
     grid_x = torch.clamp(grid_x + translation_x + 1, 0, x.size(2) + 1)
     grid_y = torch.clamp(grid_y + translation_y + 1, 0, x.size(3) + 1)
     x_pad = F.pad(x, [1, 1, 1, 1, 0, 0, 0, 0])
-    x = x_pad.permute(0, 2, 3, 1).contiguous()[grid_batch, grid_x, grid_y].permute(0, 3, 1, 2)
+    x = x_pad.permute(0, 2, 3, 1).contiguous()[
+        grid_batch, grid_x, grid_y].permute(0, 3, 1, 2)
     return x
 
 
 def rand_cutout(x, ratio=0.5, affine=None):
     if random.random() < 0.3:
-        cutout_size = int(x.size(2) * ratio + 0.5), int(x.size(3) * ratio + 0.5)
-        offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
-        offset_y = torch.randint(0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
+        cutout_size = int(x.size(2) * ratio +
+                          0.5), int(x.size(3) * ratio + 0.5)
+        offset_x = torch.randint(0, x.size(
+            2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_y = torch.randint(0, x.size(
+            3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
         grid_batch, grid_x, grid_y = torch.meshgrid(
             torch.arange(x.size(0), dtype=torch.long, device=x.device),
             torch.arange(cutout_size[0], dtype=torch.long, device=x.device),
             torch.arange(cutout_size[1], dtype=torch.long, device=x.device),
         )
-        grid_x = torch.clamp(grid_x + offset_x - cutout_size[0] // 2, min=0, max=x.size(2) - 1)
-        grid_y = torch.clamp(grid_y + offset_y - cutout_size[1] // 2, min=0, max=x.size(3) - 1)
+        grid_x = torch.clamp(grid_x + offset_x -
+                             cutout_size[0] // 2, min=0, max=x.size(2) - 1)
+        grid_y = torch.clamp(grid_y + offset_y -
+                             cutout_size[1] // 2, min=0, max=x.size(3) - 1)
         del offset_x
         del offset_y
-        mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
+        mask = torch.ones(x.size(0), x.size(2), x.size(3),
+                          dtype=x.dtype, device=x.device)
         mask[grid_batch, grid_x, grid_y] = 0
         x = x * mask.unsqueeze(1)
         del mask
@@ -356,25 +410,31 @@ def rand_cutout(x, ratio=0.5, affine=None):
         del grid_y
         del grid_batch
     return x
+
 
 def rand_erase(x, ratio=0.5, affine=None):
     ratio_x = random.randint(20, x.size(2)//2 + 20)
     ratio_y = random.randint(20, x.size(3)//2 + 20)
     if random.random() < 0.3:
-#         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
+        #         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
         cutout_size = ratio_x, ratio_y
-        offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
-        offset_y = torch.randint(0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_x = torch.randint(0, x.size(
+            2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_y = torch.randint(0, x.size(
+            3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
         grid_batch, grid_x, grid_y = torch.meshgrid(
             torch.arange(x.size(0), dtype=torch.long, device=x.device),
             torch.arange(cutout_size[0], dtype=torch.long, device=x.device),
             torch.arange(cutout_size[1], dtype=torch.long, device=x.device),
         )
-        grid_x = torch.clamp(grid_x + offset_x - cutout_size[0] // 2, min=0, max=x.size(2) - 1)
-        grid_y = torch.clamp(grid_y + offset_y - cutout_size[1] // 2, min=0, max=x.size(3) - 1)
+        grid_x = torch.clamp(grid_x + offset_x -
+                             cutout_size[0] // 2, min=0, max=x.size(2) - 1)
+        grid_y = torch.clamp(grid_y + offset_y -
+                             cutout_size[1] // 2, min=0, max=x.size(3) - 1)
         del offset_x
         del offset_y
-        mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
+        mask = torch.ones(x.size(0), x.size(2), x.size(3),
+                          dtype=x.dtype, device=x.device)
         mask[grid_batch, grid_x, grid_y] = 0
         x = x * mask.unsqueeze(1)
         del mask
@@ -382,25 +442,31 @@ def rand_erase(x, ratio=0.5, affine=None):
         del grid_y
         del grid_batch
     return x
+
 
 def rand_erase_ratio(x, ratio=0.5, affine=None):
     ratio_x = random.randint(int(x.size(2)*0.2), int(x.size(2)*0.7))
     ratio_y = random.randint(int(x.size(3)*0.2), int(x.size(3)*0.7))
     if random.random() < 0.3:
-#         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
+        #         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
         cutout_size = ratio_x, ratio_y
-        offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
-        offset_y = torch.randint(0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_x = torch.randint(0, x.size(
+            2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_y = torch.randint(0, x.size(
+            3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
         grid_batch, grid_x, grid_y = torch.meshgrid(
             torch.arange(x.size(0), dtype=torch.long, device=x.device),
             torch.arange(cutout_size[0], dtype=torch.long, device=x.device),
             torch.arange(cutout_size[1], dtype=torch.long, device=x.device),
         )
-        grid_x = torch.clamp(grid_x + offset_x - cutout_size[0] // 2, min=0, max=x.size(2) - 1)
-        grid_y = torch.clamp(grid_y + offset_y - cutout_size[1] // 2, min=0, max=x.size(3) - 1)
+        grid_x = torch.clamp(grid_x + offset_x -
+                             cutout_size[0] // 2, min=0, max=x.size(2) - 1)
+        grid_y = torch.clamp(grid_y + offset_y -
+                             cutout_size[1] // 2, min=0, max=x.size(3) - 1)
         del offset_x
         del offset_y
-        mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
+        mask = torch.ones(x.size(0), x.size(2), x.size(3),
+                          dtype=x.dtype, device=x.device)
         mask[grid_batch, grid_x, grid_y] = 0
         x = x * mask.unsqueeze(1)
         del mask
@@ -408,25 +474,31 @@ def rand_erase_ratio(x, ratio=0.5, affine=None):
         del grid_y
         del grid_batch
     return x
+
 
 def rand_stl_erase_ratio(x, ratio=0.5, affine=None):
     ratio_x = random.randint(20, x.size(2)//2 + 20)
     ratio_y = random.randint(20, x.size(3)//2 + 20)
     if random.random() < 0.3:
-#         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
+        #         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
         cutout_size = ratio_x, ratio_y
-        offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
-        offset_y = torch.randint(0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_x = torch.randint(0, x.size(
+            2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_y = torch.randint(0, x.size(
+            3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
         grid_batch, grid_x, grid_y = torch.meshgrid(
             torch.arange(x.size(0), dtype=torch.long, device=x.device),
             torch.arange(cutout_size[0], dtype=torch.long, device=x.device),
             torch.arange(cutout_size[1], dtype=torch.long, device=x.device),
         )
-        grid_x = torch.clamp(grid_x + offset_x - cutout_size[0] // 2, min=0, max=x.size(2) - 1)
-        grid_y = torch.clamp(grid_y + offset_y - cutout_size[1] // 2, min=0, max=x.size(3) - 1)
+        grid_x = torch.clamp(grid_x + offset_x -
+                             cutout_size[0] // 2, min=0, max=x.size(2) - 1)
+        grid_y = torch.clamp(grid_y + offset_y -
+                             cutout_size[1] // 2, min=0, max=x.size(3) - 1)
         del offset_x
         del offset_y
-        mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
+        mask = torch.ones(x.size(0), x.size(2), x.size(3),
+                          dtype=x.dtype, device=x.device)
         mask[grid_batch, grid_x, grid_y] = 0
         x = x * mask.unsqueeze(1)
         del mask
@@ -435,44 +507,55 @@ def rand_stl_erase_ratio(x, ratio=0.5, affine=None):
         del grid_batch
     return x
 
+
 def rand_erase2_ratio(x, ratio=0.5, affine=None):
     ratio_x = random.randint(int(x.size(2)*0.2), int(x.size(2)*0.7))
     ratio_y = random.randint(int(x.size(3)*0.2), int(x.size(3)*0.7))
     if random.random() < 0.3:
-#         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
+        #         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
         cutout_size = ratio_x, ratio_y
-        offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
-        offset_y = torch.randint(0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_x = torch.randint(0, x.size(
+            2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_y = torch.randint(0, x.size(
+            3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
         grid_batch, grid_x, grid_y = torch.meshgrid(
             torch.arange(x.size(0), dtype=torch.long, device=x.device),
             torch.arange(cutout_size[0], dtype=torch.long, device=x.device),
             torch.arange(cutout_size[1], dtype=torch.long, device=x.device),
         )
-        grid_x = torch.clamp(grid_x + offset_x - cutout_size[0] // 2, min=0, max=x.size(2) - 1)
-        grid_y = torch.clamp(grid_y + offset_y - cutout_size[1] // 2, min=0, max=x.size(3) - 1)
+        grid_x = torch.clamp(grid_x + offset_x -
+                             cutout_size[0] // 2, min=0, max=x.size(2) - 1)
+        grid_y = torch.clamp(grid_y + offset_y -
+                             cutout_size[1] // 2, min=0, max=x.size(3) - 1)
         del offset_x
         del offset_y
-        mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
+        mask = torch.ones(x.size(0), x.size(2), x.size(3),
+                          dtype=x.dtype, device=x.device)
         mask[grid_batch, grid_x, grid_y] = 0
         x = x * mask.unsqueeze(1)
         del mask
         del grid_x
         del grid_y
         del grid_batch
-        
+
         cutout_size = ratio_x, ratio_y
-        offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
-        offset_y = torch.randint(0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_x = torch.randint(0, x.size(
+            2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
+        offset_y = torch.randint(0, x.size(
+            3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
         grid_batch, grid_x, grid_y = torch.meshgrid(
             torch.arange(x.size(0), dtype=torch.long, device=x.device),
             torch.arange(cutout_size[0], dtype=torch.long, device=x.device),
             torch.arange(cutout_size[1], dtype=torch.long, device=x.device),
         )
-        grid_x = torch.clamp(grid_x + offset_x - cutout_size[0] // 2, min=0, max=x.size(2) - 1)
-        grid_y = torch.clamp(grid_y + offset_y - cutout_size[1] // 2, min=0, max=x.size(3) - 1)
+        grid_x = torch.clamp(grid_x + offset_x -
+                             cutout_size[0] // 2, min=0, max=x.size(2) - 1)
+        grid_y = torch.clamp(grid_y + offset_y -
+                             cutout_size[1] // 2, min=0, max=x.size(3) - 1)
         del offset_x
         del offset_y
-        mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
+        mask = torch.ones(x.size(0), x.size(2), x.size(3),
+                          dtype=x.dtype, device=x.device)
         mask[grid_batch, grid_x, grid_y] = 0
         x = x * mask.unsqueeze(1)
         del mask
@@ -480,6 +563,7 @@ def rand_erase2_ratio(x, ratio=0.5, affine=None):
         del grid_y
         del grid_batch
     return x
+
 
 def rand_rand_erase_ratio(x, ratio=0.5, affine=None):
     ratio_x = random.randint(int(x.size(2)*0.2), int(x.size(2)*0.7))
@@ -487,19 +571,26 @@ def rand_rand_erase_ratio(x, ratio=0.5, affine=None):
 #     if random.random() < 0.3:
 #         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
     cutout_size = ratio_x, ratio_y
-    offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
-    offset_y = torch.randint(0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
+    offset_x = torch.randint(0, x.size(
+        2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
+    offset_y = torch.randint(0, x.size(
+        3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
     grid_batch, grid_x, grid_y = torch.meshgrid(
         torch.arange(x.size(0), dtype=torch.long, device=x.device),
         torch.arange(cutout_size[0], dtype=torch.long, device=x.device),
         torch.arange(cutout_size[1], dtype=torch.long, device=x.device),
     )
-    grid_x = torch.clamp(grid_x + offset_x - cutout_size[0] // 2, min=0, max=x.size(2) - 1)
-    grid_y = torch.clamp(grid_y + offset_y - cutout_size[1] // 2, min=0, max=x.size(3) - 1)
-    mask = torch.ones(x.size(0), x.size(2), x.size(3), dtype=x.dtype, device=x.device)
+    grid_x = torch.clamp(grid_x + offset_x -
+                         cutout_size[0] // 2, min=0, max=x.size(2) - 1)
+    grid_y = torch.clamp(grid_y + offset_y -
+                         cutout_size[1] // 2, min=0, max=x.size(3) - 1)
+    mask = torch.ones(x.size(0), x.size(2), x.size(3),
+                      dtype=x.dtype, device=x.device)
     mask[grid_batch, grid_x, grid_y] = 0
-    x[:int(x.size(0)*0.3)] = x[:int(x.size(0)*0.3)] * mask[:int(x.size(0)*0.3)].unsqueeze(1)
+    x[:int(x.size(0)*0.3)] = x[:int(x.size(0)*0.3)] * \
+        mask[:int(x.size(0)*0.3)].unsqueeze(1)
     return x
+
 
 def rand_cutmix(x, affine=None):
     def rand_bbox(size, lam):
@@ -518,7 +609,7 @@ def rand_cutmix(x, affine=None):
 #             cy = 0
 #         else:
 #             cy = int(H*0.6)
-            
+
         cx = np.random.randint(W)
         cy = np.random.randint(H)
 
@@ -528,7 +619,7 @@ def rand_cutmix(x, affine=None):
         bby2 = np.clip(cy + cut_h, 0, H)
 
         return bbx1, bby1, bbx2, bby2
-    
+
     lam = 0.45 + 0.1*random.random()
     rand_index = torch.randperm(x.size()[0]).cuda()
 #     for i in range(10000):
@@ -546,8 +637,8 @@ def rand_cutmix(x, affine=None):
 #     cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
 #     offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
 #     offset_y = torch.randint(0, x.size(3) + (1 - cutout_size[1] % 2), size=[x.size(0), 1, 1], device=x.device)
-    
-    
+
+
 #     if random.random() < 0.3:
 #         cutout_size = int(x.size(2) * ratio_x + 0.5), int(x.size(3) * ratio_y + 0.5)
 #         offset_x = torch.randint(0, x.size(2) + (1 - cutout_size[0] % 2), size=[x.size(0), 1, 1], device=x.device)
@@ -571,10 +662,11 @@ def rand_cutmix(x, affine=None):
 #     return x
 
 def rand_rotate(x, ratio=0.5, affine=None):
-    k = random.randint(1,3)
+    k = random.randint(1, 3)
     if random.random() < ratio:
-        x = torch.rot90(x, k, [2,3])
+        x = torch.rot90(x, k, [2, 3])
     return x
+
 
 AUGMENT_FNS = {
     'color': [rand_brightness, rand_saturation, rand_contrast],

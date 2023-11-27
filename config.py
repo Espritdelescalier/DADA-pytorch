@@ -1,6 +1,6 @@
 class Config(object):
     data_dir = './data/cifar-10-batches-py'  # train data and test data dir
-    gpu_id = '0'  # gpu id
+    gpu_id = '0,1,2'  # gpu id
     train_batch_size = 100
     test_batch_size = 500
     aug = True  # whether data augment

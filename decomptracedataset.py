@@ -23,7 +23,8 @@ class DecompTraceDataset(Dataset):
                  sep_tok: bool = False,
                  normalize: bool = False,
                  num_classes: int = 1,
-                 flat: bool = False):
+                 flat: bool = False,
+                 one_hot: bool = False):
 
         self.root_dir = root_dir
         self.target_length = target_length
@@ -37,6 +38,7 @@ class DecompTraceDataset(Dataset):
         self.normal = normalize
         self.flip_rate = flip_rate
         self.flat = flat
+        self.one_hot = one_hot
         self.num_labels = len(self.dir_list)
         self.per_class_file_list = [None]*self.num_labels
         for i in range(len(self.per_class_file_list)):
@@ -75,8 +77,11 @@ class DecompTraceDataset(Dataset):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
+        # print(self.per_class_file_list[0][1])
+        # print(self.per_class_file_list[1][1])
         fname = self.per_class_file_list[self.idx_array[idx]
                                          [0]][self.idx_array[idx][1]]
+
         path = os.path.join(
             self.root_dir, self.dir_list[self.idx_array[idx][0]]
         )
@@ -94,7 +99,12 @@ class DecompTraceDataset(Dataset):
         Sequence processing
         """
         seq = np.array(data)
+        flip = np.random.random()
+        if self.hflip:
+            if flip < self.flip_rate:
+                seq = np.flip(seq, axis=1)
         shape = seq.shape
+
         if self.normal:
             seq = seq.flatten()
             seq = scipy.stats.zscore(seq, axis=0)
@@ -110,6 +120,9 @@ class DecompTraceDataset(Dataset):
         """seq = np.pad(seq[2:, 1000+r:4096+r], [(0, 0), (0, 1)],
                      mode='constant', constant_values=-1)  # .flatten()[:-1]"""
 
+        mini = np.min(seq.flatten())
+        maxi = np.max(seq.flatten())
+        seq = 2*((seq-mini)/(maxi-mini))-1
         # print(f"seq shape {seq.shape}")
         if self.flat:
             seq = seq.flatten()
@@ -120,17 +133,13 @@ class DecompTraceDataset(Dataset):
         else:
             mask = np.ones(seq.shape)
 
-        if self.num_classes != 1:
+        if self.one_hot:
             label = F.one_hot(
                 torch.tensor(label, dtype=torch.int64), num_classes=self.num_labels)
             # print(f"labels shape {label.shape}")
             # label[(0, 1)[idx >= len(self.file_list_ano)]] = 1
 
-        flip = np.random.random()
         invert = np.random.random()
-        if self.hflip:
-            if flip < self.flip_rate:
-                seq = np.flip(seq)
         if self.vflip:
             if invert < self.flip_rate:
                 seq = -seq
