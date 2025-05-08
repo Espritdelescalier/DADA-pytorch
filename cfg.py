@@ -37,7 +37,7 @@ def parse_args():
                         'N processes per node, which has N GPUs. This is the '
                         'fastest way to use PyTorch for either single node or '
                         'multi node data parallel training')
-    parser.add_argument('--max_epoch', type=int, default=700,
+    parser.add_argument('--max_epoch', type=int, default=300,
                         help='number of epochs of training')
     parser.add_argument('--max_iter', type=int, default=None,
                         help='set the max iteration number')
@@ -61,7 +61,7 @@ def parse_args():
                         help='adam: decay of first order momentum of gradient')
     parser.add_argument('--num_workers', type=int, default=12,
                         help='number of cpu threads to use during batch generation')
-    parser.add_argument('--latent_dim', type=int, default=128,
+    parser.add_argument('--latent_dim', type=int, default=64,  # 128
                         help='dimensionality of the latent space')
     parser.add_argument('--img_size', type=int, default=16384,
                         help='size of each image dimension')
@@ -85,7 +85,7 @@ def parse_args():
                         help='dataset type')
     parser.add_argument('--data_path', type=str, default='./data',
                         help='The path of data set')
-    parser.add_argument('--init_type', type=str, default='normal',
+    parser.add_argument('--init_type', type=str, default='xavier_uniform',
                         choices=['normal', 'orth', 'xavier_uniform', 'false'],
                         help='The init type')
     parser.add_argument('--gf_dim', type=int, default=256,
@@ -212,6 +212,10 @@ def parse_args():
                         help='sequence generation examples directory')
     parser.add_argument('--stratified_split', action='store_true',
                         help='split dataset into stratified train and test sets')
+    parser.add_argument('--growth_factor', type=int, default=2,
+                        help='upsampling factor of sequence during generator forward pass')
+    parser.add_argument('--n_channels_g', type=int, default=8,
+                        help='number of sub frequency ranges generated')
 
     opt = parser.parse_args()
 

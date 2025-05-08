@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
+from torch.optim import lr_scheduler
 import torch.utils.data as data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
@@ -21,7 +22,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 import cifar10_data
 from tensorboardX import SummaryWriter
 from config import Config
-from Nets import _G, _D, Train
+from Nets import _G, _D, Train, _G3, _G4
 from ViT_custom_local544444_256_rp_noise import Generator, Discriminator
 from perceiver_pytorch import Perceiver
 import numpy as np
@@ -66,18 +67,6 @@ def setup_dataflow(dataset, train_idx, trainbsz, val_idx, valbsz, workers):
     return train_loader, val_loader
 
 
-def weights_init(m):
-    classname = m.__class__.__name__
-    if classname.find('Conv2') != -1 or classname.find('ConvTranspose2d') != -1:
-        nn.init.normal_(m.weight.data, 0.0, 0.05)
-    elif classname.find('BatchNorm') != -1:
-        nn.init.normal_(m.weight.data, 1.0, 0.02)
-        # nn.init.constant_(m.bias.data, 0)
-    """elif classname.find('Linear') != -1:
-        nn.init.normal_(m.weight.data, 1.0, 0.05)
-        # nn.init.constant_(m.bias.data, 0)"""
-
-
 def adjust_learning_rate(optimizer, decay):
     for param_group in optimizer.param_groups:
         param_group['lr'] *= decay
@@ -86,6 +75,42 @@ def adjust_learning_rate(optimizer, decay):
 def main():
 
     args = cfg.parse_args()
+
+    def weights_init_D(m):
+        classname = m.__class__.__name__
+        if classname.find('Conv1') != -1 or classname.find('ConvTranspose1d') != -1:
+            nn.init.normal_(m.weight.data, 0.0, 0.05)
+        elif classname.find('BatchNorm') != -1:
+            nn.init.normal_(m.weight.data, 1.0, 0.02)
+            # nn.init.constant_(m.bias.data, 0)
+        elif classname.find('Linear') != -1:
+            nn.init.normal_(m.weight.data, 1.0, 0.05)
+            # nn.init.constant_(m.bias.data, 0)
+
+    def weights_init_G(m):
+        classname = m.__class__.__name__
+        """if classname.find('Conv2') != -1 or classname.find('ConvTranspose2d') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.05)
+        elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        # nn.init.constant_(m.bias.data, 0)
+        elif classname.find('Linear') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.05)
+        # nn.init.constant_(m.bias.data, 0)"""
+        if classname.find('Conv1d') != -1:
+            if args.init_type == 'normal':
+                nn.init.normal_(m.weight.data, 0.0, 0.02)
+            elif args.init_type == 'orth':
+                nn.init.orthogonal_(m.weight.data)
+            elif args.init_type == 'xavier_uniform':
+                nn.init.xavier_uniform(m.weight.data, 1.)
+            else:
+                raise NotImplementedError(
+                    '{} unknown inital type'.format(args.init_type))
+        elif classname.find('BatchNorm1d') != -1:
+            nn.init.normal_(m.weight.data, 1.0, 0.02)
+            nn.init.constant_(m.bias.data, 0.0)
+
     now = datetime.now()
     current = now.strftime("%Y%m%d%H%M")
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
@@ -95,9 +120,10 @@ def main():
     # Random seed
     if args.seed is None:
         args.seed = random.randint(1, 10000)
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     if use_cuda:
         torch.cuda.manual_seed_all(args.seed)
 
@@ -115,7 +141,7 @@ def main():
     seq_dataset = DecompTraceDataset(
         root_dir=dataset_config.root_dir,  # "../../../../raid/damien/new_code_decomp/",
         target_length=16384,
-        hflip=True,
+        hflip=False,
         vflip=False,
         flip_rate=0.9,
         randshift=True,
@@ -173,17 +199,17 @@ def main():
     # testx, testy = cifar10_data.load(opt.data_dir, subset='test')
 
     # Model
-    # G = _G(num_classes=opt.num_classes)
+    G = _G4(num_classes=args.num_classes)
     # D = _D(num_classes=opt.num_classes)
     # G = eval(args.gen_model+'.Generator')(args=args)
     # D = eval(args.dis_model+'.Discriminator')(args=args)
-    G = Generator(
-        args=args, num_classes=args.num_classes).float()
-    D = Discriminator(
-        args=args, num_classes=args.num_classes).float()
+    """G = Generator(
+        args=args, num_classes=args.num_classes, logits=False).float()"""
+    """D = Discriminator(
+        args=args, num_classes=args.num_classes).float()"""
 
     # For perceiver the input expected is of shape batch, sequence, channels
-    """D = Perceiver(
+    D = Perceiver(
         input_channels=1,
         input_axis=1,
         num_freq_bands=6,
@@ -195,25 +221,27 @@ def main():
         latent_heads=8,
         cross_dim_head=64,
         latent_dim_head=64,
-        num_classes=args.num_classes,
+        num_classes=args.num_classes*2,
         attn_dropout=0.,
         ff_dropout=0.,
         weight_tie_layers=False,
         fourier_encode_data=True,
         self_per_cross_attn=2
-    ).float()"""
+    ).float()
 
     if use_cuda:
         D = torch.nn.DataParallel(D).cuda()
         G = torch.nn.DataParallel(G).cuda()
 
         cudnn.benchmark = True
-    D.apply(weights_init)
-    G.apply(weights_init)
+    # D.apply(weights_init_D)
+    G.apply(weights_init_G)
     print('    G params: %.2fM,D params: %.2fM' % (sum(p.numel()
           for p in G.parameters())/1000000.0, sum(p.numel() for p in D.parameters())/1000000.0))
     optimizerD = optim.Adam(D.parameters(), lr=args.d_lr, betas=(0.5, 0.999))
     optimizerG = optim.Adam(G.parameters(), lr=args.g_lr, betas=(0.5, 0.999))
+    scheduler_G = lr_scheduler.ReduceLROnPlateau(
+        optimizerG, 'min', threshold=0.001, factor=0.5)
     T = Train(G, D, optimizerG, optimizerD,
               args.num_classes, args.latent_dim)
     # data shffule
@@ -250,6 +278,9 @@ def main():
                 x_batch = x_batch[:, None, :].float()
                 gen_y = torch.from_numpy(np.int32(np.random.choice(
                     args.num_classes, (y_batch.shape[0],)))).long()
+                """
+                # TODO avoir un gen_y identique aux vrai labels pour aider la feature loss
+                """
                 d_loss, train_acc, f1_train = T.train_batch_disc(
                     x_batch, y_batch, gen_y, weight_gen_loss, f1_train
                 )
@@ -267,6 +298,7 @@ def main():
                 nr_batches_train += 1
         else:
             # train Classifier
+
             for _, x_batch, _, y_batch, _ in train_loader:
                 x_batch = x_batch[:, None, :].float()
                 index += 1
@@ -283,11 +315,12 @@ def main():
                 break"""
         D_loss /= nr_batches_train
         G_loss /= (nr_batches_train*2)
+        # scheduler_G.step(G_loss)
         Train_acc /= nr_batches_train
 
         # test
         test_acc = 0.0
-        if epoch > args.G_epochs and epoch % 100 == 0:
+        if epoch > args.G_epochs and epoch % 50 == 0:
             adjust_learning_rate(optimizerD, 0.1)
 
         for _, x_batch, _, y_batch, _ in test_loader:
@@ -299,7 +332,7 @@ def main():
         f_test = f1_test.compute()
         f1_test.reset()
         test_acc /= nr_batches_test
-        #f_test = f1_test.compute()
+        # f_test = f1_test.compute()
 
         if test_acc > best_acc:
             best_acc = test_acc
@@ -312,14 +345,14 @@ def main():
         if epoch <= args.G_epochs:
             # T.save_png(opt.save_img, epoch)
             T.save_img(args.save_img, epoch, 2048, args.img_size,
-                       args.num_classes)
+                       args.num_classes, args)
             pass
 
         if (epoch+1) % (args.print_freq) == 0:
-            print("Iteration %d, D_loss = %.4f,G_loss = %.4f,train acc = %.4f, train f1 = %.4f, test acc = %.4f, test f1 = %.4f, best acc = %.4f, best f1 = %.4f, lr = %.8f" % (
-                epoch, D_loss, G_loss, Train_acc, f_train, test_acc, f_test, best_acc, best_fone, optimizerD.param_groups[0]['lr']))
-            loss_res.append("Iteration %d, D_loss = %.4f,G_loss = %.4f,train acc = %.4f, train f1 = %.4f, test acc = %.4f, test f1 = %.4f, best acc = %.4f, best f1 = %.4f, lr = %.8f \n" % (
-                epoch, D_loss, G_loss, Train_acc, f_train, test_acc, f_test, best_acc, best_fone, optimizerD.param_groups[0]['lr']))
+            print("Iteration %d, D_loss = %.4f,G_loss = %.4f,train acc = %.4f, train f1 = %.4f, test acc = %.4f, test f1 = %.4f, best acc = %.4f, best f1 = %.4f, lr = %.10f, G_lr = %.10f" % (
+                epoch, D_loss, G_loss, Train_acc, f_train, test_acc, f_test, best_acc, best_fone, optimizerD.param_groups[0]['lr'], optimizerG.param_groups[0]['lr']))
+            loss_res.append("Iteration %d, D_loss = %.4f,G_loss = %.4f,train acc = %.4f, train f1 = %.4f, test acc = %.4f, test f1 = %.4f, best acc = %.4f, best f1 = %.4f, lr = %.10f, G_lr = %.10f\n" % (
+                epoch, D_loss, G_loss, Train_acc, f_train, test_acc, f_test, best_acc, best_fone, optimizerD.param_groups[0]['lr'], optimizerG.param_groups[0]['lr']))
         # viso
         writer.add_scalar('train/D_loss', D_loss, epoch)
         writer.add_scalar('train/G_loss', G_loss, epoch)

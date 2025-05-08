@@ -5,6 +5,7 @@ import numpy as np
 from ViT_helper import DropPath, to_2tuple, trunc_normal_
 from diff_aug import DiffAugment
 import torch.utils.checkpoint as checkpoint
+import einops
 
 # "long" and "short" denote longer and shorter samples
 
@@ -135,9 +136,10 @@ class Mlp(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., window_size=16):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., window_size=16, num_classes=0):
         super().__init__()
         self.num_heads = num_heads
+        self.num_classes = num_classes
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
         # print(f"dim {dim}, qk_scale {qk_scale}")
@@ -193,7 +195,7 @@ class Attention(nn.Module):
 
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-        x = self.mat(attn, v).transpose(1, 2).reshape(B, N, C)
+        x = self.mat(attn, v).transpose(1, 2).reshape(B, N, -1)
         # print(torch.max(x))
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -225,12 +227,12 @@ class CustomNorm(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=gelu, norm_layer=nn.LayerNorm, window_size=16):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0., drop_path=0., act_layer=gelu, norm_layer=nn.LayerNorm, window_size=16, num_classes=0):
         super().__init__()
+        self.num_classes = num_classes
         self.norm1 = CustomNorm(norm_layer, dim)
         self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, window_size=window_size)
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, window_size=window_size, num_classes=num_classes)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
 
         self.drop_path = DropPath(
@@ -242,16 +244,18 @@ class Block(nn.Module):
 
     def forward(self, x):
         # print("inside block ", torch.max(x))
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+        # print(x.shape)
+        x = self.drop_path(self.attn(self.norm1(x))) + \
+            x
         # print("inside block after attention ", torch.max(x))
         x = self.mlp(self.norm2(x))
-        # print("inside block after mlp ", torch.max(x))
+        # print("inside block after mlp ", torch.max(x))
         x = x + self.drop_path(x)
         return x
 
 
 class StageBlock(nn.Module):
-    def __init__(self, depth, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0., drop_path=0., act_layer=gelu, norm_layer=nn.LayerNorm, window_size=16):
+    def __init__(self, depth, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0., drop_path=0., act_layer=gelu, norm_layer=nn.LayerNorm, window_size=16, num_classes=0):
         super().__init__()
         self.depth = depth
         models = [Block(
@@ -265,7 +269,8 @@ class StageBlock(nn.Module):
             drop_path=drop_path,
             act_layer=act_layer,
             norm_layer=norm_layer,
-            window_size=window_size
+            window_size=window_size,
+            num_classes=num_classes
         ) for i in range(depth)]
         self.block = nn.Sequential(*models)
 
@@ -278,20 +283,20 @@ class StageBlock(nn.Module):
         return x
 
 
-def pixel_upsample(x, H):
+def pixel_upsample(x, H, factor):
     B, N, C = x.size()
     x = x.permute(0, 2, 1)
-    x = PixelShuffle1D(4)(x)  # PixelShuffle1d
+    x = PixelShuffle1D(factor)(x)  # PixelShuffle1d
     B, C, H = x.size()
     x = x.permute(0, 2, 1)
     return x, H
 
 
-def bicubic_upsample(x, H):
+def bicubic_upsample(x, H, factor):
     B, N, C = x.size()
     x = x.permute(0, 2, 1)
     # x = x.view(-1, C, H, W)
-    x = nn.functional.interpolate(x, scale_factor=4, mode='linear')
+    x = nn.functional.interpolate(x, scale_factor=factor, mode='linear')
     B, C, H = x.size()
     # x = x.view(-1, C, H*W)
     x = x.permute(0, 2, 1)
@@ -332,11 +337,12 @@ def window_reverse(windows, window_size, H):
 class Generator(nn.Module):
     def __init__(self, args, img_size=224, patch_size=16, in_chans=3, num_classes=10, embed_dim=384, depth=5,
                  num_heads=4, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm):
+                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm,
+                 logits=True):
         super(Generator, self).__init__()
         self.args = args
         self.ch = embed_dim
-        self.bottom_width = args.bottom_width
+        self.bottom_width = args.latent_dim
         self.embed_dim = embed_dim = args.gf_dim
         self.window_size = args.g_window_size
         self.num_classes = args.num_classes
@@ -346,6 +352,8 @@ class Generator(nn.Module):
         act_layer = args.g_act
         self.l2_size = 0
         self.out_act = nn.Tanh()
+        self.factor = args.growth_factor
+        self.logits = logits
 
         if self.l2_size == 0:
             self.l1 = nn.Linear(
@@ -365,15 +373,15 @@ class Generator(nn.Module):
         self.pos_embed_1 = nn.Parameter(
             torch.zeros(1, self.bottom_width, embed_dim))
         self.pos_embed_2 = nn.Parameter(torch.zeros(
-            1, (self.bottom_width*2)*2, embed_dim))
+            1, (self.bottom_width)*(args.growth_factor**1), embed_dim))
         self.pos_embed_3 = nn.Parameter(torch.zeros(
-            1, (self.bottom_width*4)*4, embed_dim))
+            1, (self.bottom_width)*(args.growth_factor**2), embed_dim))
         self.pos_embed_4 = nn.Parameter(torch.zeros(
-            1, (self.bottom_width*8)*8, embed_dim//4))
+            1, (self.bottom_width)*(args.growth_factor**3), embed_dim//(self.factor)))
         self.pos_embed_5 = nn.Parameter(torch.zeros(
-            1, (self.bottom_width*16)*16, embed_dim//16))
+            1, (self.bottom_width)*(args.growth_factor**4), embed_dim//(self.factor**2)))
         self.pos_embed_6 = nn.Parameter(torch.zeros(
-            1, (self.bottom_width*32)*32, embed_dim//64))
+            1, (self.bottom_width)*(args.growth_factor**5), embed_dim//(self.factor**3)))
 
         self.pos_embed = [
             self.pos_embed_1,
@@ -382,28 +390,6 @@ class Generator(nn.Module):
             self.pos_embed_4,
             self.pos_embed_5,
             self.pos_embed_6
-        ]
-
-        self.pos_gen_y_1 = nn.Parameter(
-            torch.zeros(1, self.num_classes, embed_dim))
-        self.pos_gen_y_2 = nn.Parameter(torch.zeros(
-            1, self.num_classes, embed_dim))
-        self.pos_gen_y_3 = nn.Parameter(torch.zeros(
-            1, self.num_classes, embed_dim))
-        self.pos_gen_y_4 = nn.Parameter(torch.zeros(
-            1, self.num_classes, embed_dim//4))
-        self.pos_gen_y_5 = nn.Parameter(torch.zeros(
-            1, self.num_classes, embed_dim//16))
-        self.pos_gen_y_6 = nn.Parameter(torch.zeros(
-            1, self.num_classes, embed_dim//64))
-
-        self.pos_gen_y_embed = [
-            self.pos_gen_y_1,
-            self.pos_gen_y_2,
-            self.pos_gen_y_3,
-            self.pos_gen_y_4,
-            self.pos_gen_y_5,
-            self.pos_gen_y_6
         ]
 
         # stochastic depth decay rule
@@ -420,7 +406,8 @@ class Generator(nn.Module):
             drop_path=0,
             act_layer=act_layer,
             norm_layer=norm_layer,
-            window_size=self.bottom_width+self.num_classes
+            window_size=self.bottom_width,
+            num_classes=self.num_classes
         )
         self.blocks_2 = StageBlock(
             depth=depth[1],
@@ -434,7 +421,9 @@ class Generator(nn.Module):
             drop_path=0,
             act_layer=act_layer,
             norm_layer=norm_layer,
-            window_size=self.bottom_width*4+self.num_classes
+            window_size=self.bottom_width *
+            (args.growth_factor**1),
+            num_classes=self.num_classes
         )
         self.blocks_3 = StageBlock(
             depth=depth[2],
@@ -448,11 +437,13 @@ class Generator(nn.Module):
             drop_path=0,
             act_layer=act_layer,
             norm_layer=norm_layer,
-            window_size=self.bottom_width*16+self.num_classes
+            window_size=self.bottom_width *
+            (args.growth_factor**2),
+            num_classes=self.num_classes
         )
         self.blocks_4 = StageBlock(
             depth=depth[3],
-            dim=embed_dim//4,
+            dim=embed_dim//(self.factor),
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             qkv_bias=qkv_bias,
@@ -462,11 +453,12 @@ class Generator(nn.Module):
             drop_path=0,
             act_layer=act_layer,
             norm_layer=norm_layer,
-            window_size=self.window_size+self.num_classes
+            window_size=self.window_size,
+            num_classes=self.num_classes
         )
         self.blocks_5 = StageBlock(
             depth=depth[4],
-            dim=embed_dim//16,
+            dim=embed_dim//(self.factor**2),
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             qkv_bias=qkv_bias,
@@ -476,11 +468,12 @@ class Generator(nn.Module):
             drop_path=0,
             act_layer=act_layer,
             norm_layer=norm_layer,
-            window_size=self.window_size+self.num_classes
+            window_size=self.window_size,
+            num_classes=self.num_classes
         )
         self.blocks_6 = StageBlock(
             depth=depth[5],
-            dim=embed_dim//64,
+            dim=embed_dim//(self.factor**3),
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             qkv_bias=qkv_bias,
@@ -490,7 +483,8 @@ class Generator(nn.Module):
             drop_path=0,
             act_layer=act_layer,
             norm_layer=norm_layer,
-            window_size=self.window_size+self.num_classes
+            window_size=self.window_size,
+            num_classes=self.num_classes
         )
 
         for i in range(len(self.pos_embed)):
@@ -499,137 +493,101 @@ class Generator(nn.Module):
             nn.Conv2d(self.embed_dim//64, 3, 1, 1, 0)
         )"""
         self.deconv = nn.Sequential(
-            nn.Linear(self.embed_dim//64, 1)
+            nn.Linear(self.embed_dim//(self.factor**3), args.n_channels_g)
         )
-#         self.apply(self._init_weights)
+        # self.apply(self._init_weights)
 
-#     def _init_weights(self, m):
-#         if isinstance(m, nn.Linear):
-#             trunc_normal_(m.weight, std=.02)
-#             if isinstance(m, nn.Linear) and m.bias is not None:
-#                 nn.init.constant_(m.bias, 0)
-#         elif isinstance(m, nn.Conv2d):
-#             trunc_normal_(m.weight, std=.02)
-#             if isinstance(m, nn.Conv2d) and m.bias is not None:
-#                 nn.init.constant_(m.bias, 0)
-#         elif isinstance(m, nn.LayerNorm):
-#             nn.init.constant_(m.bias, 0)
-#             nn.init.constant_(m.weight, 1.0)
-#         elif isinstance(m, nn.BatchNorm1d):
-#             nn.init.constant_(m.bias, 0)
-#             nn.init.constant_(m.weight, 1.0)
-#         elif isinstance(m, nn.InstanceNorm1d):
-#             nn.init.constant_(m.bias, 0)
-#             nn.init.constant_(m.weight, 1.0)
     def forward(self, z, gen_y):
-        # print("z", torch.max(z))
         if self.args.latent_norm:
             latent_size = z.size(-1)
             z = (z/z.norm(dim=-1, keepdim=True) * (latent_size ** 0.5))
         if self.l2_size == 0:
             x = self.l1(z).view(-1, self.bottom_width, self.embed_dim)
-            gen_y = self.lgen_y(gen_y[:, :, None])
+            # gen_y = self.lgen_y(gen_y[:, :, None])
         elif self.l2_size > 1000:
             x = self.l1(z).view(-1, self.bottom_width ** 2, self.l2_size//16)
-            # x = torch.concat(self.l2(x), gen_y)
             x = self.l2(x)
         else:
             x = self.l1(z).view(-1, self.bottom_width ** 2, self.l2_size)
             x = self.l2(x)
-        # print("x after if else", torch.max(x))
 
-        x = torch.concat(
-            (x + self.pos_embed[0], gen_y + self.pos_gen_y_embed[0]), dim=1)
+        gen_y = gen_y[:, None, :]
+        """x = torch.cat(
+            [x + self.pos_embed[0], gen_y.float()*torch.ones(x.shape[0], x.shape[1], gen_y.shape[2]).cuda()], dim=-1)"""
+        x = x + self.pos_embed[0]
+        x[:, :, -self.num_classes:] = gen_y.float()
+        # *torch.ones(x.shape[0],x.shape[1], gen_y.shape[2]).cuda()
         B = x.size()
         H = self.bottom_width
-        # print("x before block 1", torch.max(x))
         x = self.blocks_1(x)
-        # print("x after block 1", torch.max(x))
 
-        gen_y = x[:, -self.num_classes:, :]
-        x, H = bicubic_upsample(x[:, :-self.num_classes, :], H)
-        # cut embedding of gen_y and concat to x[-self.num_classes:] bellow
-        x = torch.concat(
-            (x + self.pos_embed[1], gen_y + self.pos_gen_y_embed[1]), dim=1)
+        x, H = bicubic_upsample(x, H, self.factor)
+        x = x + self.pos_embed[1]
+        x[:, :, -self.num_classes:] = gen_y.float()
+        # *torch.ones(x.shape[0],x.shape[1], gen_y.shape[2]).cuda()
+        # x = torch.cat([x + self.pos_embed[1], gen_y], dim=-1)
         B, _, C = x.size()
-        # print("x before block 2", torch.max(x))
         x = self.blocks_2(x)
-        # print("x after block 2", torch.max(x))
-        # print(torch.max(x))
-        gen_y = x[:, -self.num_classes:, :]
-        x, H = bicubic_upsample(x[:, :-self.num_classes, :], H)
-        # cut embedding of gen_y and concat to x[-self.num_classes:] bellow
-        x = torch.concat(
-            (x + self.pos_embed[2], gen_y + self.pos_gen_y_embed[2]), dim=1)
+
+        x, H = bicubic_upsample(x, H, self.factor)
+        x = x + self.pos_embed[2]
+        x[:, :, -self.num_classes:] = gen_y.float()
+        # *torch.ones(x.shape[0],x.shape[1], gen_y.shape[2]).cuda()
+        #x = torch.cat([x + self.pos_embed[2], gen_y], dim=-1)
         B, _, C = x.size()
         x = self.blocks_3(x)
-        # print(torch.max(x))
-        gen_y = x[:, -self.num_classes:, :]
-        x, H = pixel_upsample(x[:, :-self.num_classes, :], H)
-        # cut embedding of gen_y and concat to x[-self.num_classes:] bellow
-        gen_y = _1Ddownsample(gen_y)
-        gen_y = torch.repeat_interleave(
-            gen_y, H//self.window_size, dim=0)
+
+        x, H = pixel_upsample(x, H, self.factor)
         x = x + self.pos_embed[3]
         B, _, C = x.size()
         x = x.view(B, H, C)
         x = window_partition(x, self.window_size)
-        # increase embedding of gen_y and concat to x[-self.num_classes:] bellow
-        # TO TRY separate pos embed for gen_y to avoid concat before window_partition
-        # x = x.view(-1, self.window_size*self.window_size, C)
-        x = torch.concat((x, gen_y + self.pos_gen_y_embed[3]), dim=1)
+        gen_y = gen_y.float()
+        # * \torch.ones(x.shape[0], x.shape[1], gen_y.shape[2]).cuda()
+        """print("gen_y before repeat", gen_y.shape)
+        gen_y = einops.repeat(gen_y, 'b n c -> (repeat b) n c', repeat=2)
+        print("gen_y after repeat", gen_y.shape)
+        print("x shape before gen_y cat", x.shape)"""
+        x[:, :, -self.num_classes:] = gen_y
+        # x = torch.cat([x, gen_y], dim=-1)
         x = self.blocks_4(x)
-        # print(torch.max(x))
-        # x = x.view(-1, self.window_size, self.window_size, C)
-        gen_y = x[:, -self.num_classes:, :]
-        gen_y = _1Ddownsample(gen_y.permute(2, 1, 0), H //
-                              self.window_size).permute(2, 1, 0)
-        x = window_reverse(x[:, :-self.num_classes, :],
-                           self.window_size, H).view(B, H, C)
+        x = window_reverse(x, self.window_size, H).view(B, H, C)
 
-        # gen_y = x[:, -self.num_classes:, :]
-        x, H = pixel_upsample(x, H)
-        # cut embedding of gen_y and concat to new x bellow
-        gen_y = _1Ddownsample(gen_y)
-        gen_y = torch.repeat_interleave(
-            gen_y, H//self.window_size, dim=0)
+        x, H = pixel_upsample(x, H, self.factor)
         x = x + self.pos_embed[4]
         B, _, C = x.size()
         x = x.view(B, H, C)
         x = window_partition(x, self.window_size)
-        # increase embedding of gen_y and concat to new x bellow
-        # x = x.view(-1, self.window_size*self.window_size, C)
-        x = torch.concat((x, gen_y + self.pos_gen_y_embed[4]), dim=1)
+        gen_y = gen_y.float()
+        # * \torch.ones(x.shape[0]//2, x.shape[1], gen_y.shape[2]).cuda()
+        gen_y = einops.repeat(gen_y, 'b n c -> (repeat b) n c', repeat=2)
+        x[:, :, -self.num_classes:] = gen_y
+        # x = torch.cat([x, gen_y], dim=-1)
         x = self.blocks_5(x)
-        # x = x.view(-1, self.window_size, self.window_size, C)
-        gen_y = x[:, -self.num_classes:, :]
-        gen_y = _1Ddownsample(gen_y.permute(2, 1, 0), H //
-                              self.window_size).permute(2, 1, 0)
-        x = window_reverse(x[:, :-self.num_classes, :],
-                           self.window_size, H).view(B, H, C)
+        x = window_reverse(x, self.window_size, H).view(B, H, C)
 
-        # gen_y = x[:, -self.num_classes:, :]
-        x, H = pixel_upsample(x, H)
-        # cut embedding of gen_y and concat to x[-self.num_classes:] bellow
-        gen_y = _1Ddownsample(gen_y)
-        gen_y = torch.repeat_interleave(
-            gen_y, H//self.window_size, dim=0)
+        x, H = pixel_upsample(x, H, self.factor)
         x = x + self.pos_embed[5]
         B, _, C = x.size()
-        # x = x.view(B, H, W, C)
         x = window_partition(x, self.window_size)
-        # increase embedding of gen_y and concat to x[-self.num_classes:] bellow
-        # x = x.view(-1, self.window_size*self.window_size, C)
-        x = torch.concat((x, gen_y + self.pos_gen_y_embed[5]), dim=1)
+        gen_y = gen_y.float()
+        # * \torch.ones(x.shape[0]//2, x.shape[1], gen_y.shape[2]).cuda()
+        gen_y = einops.repeat(gen_y, 'b n c -> (repeat b) n c', repeat=2)
+        x[:, :, -self.num_classes:] = gen_y
+        """x[:, :, -self.num_classes:] = gen_y.float()*torch.ones(x.shape[0],
+                                                               x.shape[1], gen_y.shape[2]).cuda()"""
+        # x = torch.cat([x, gen_y], dim=-1)
         x = self.blocks_6(x)
-        gen_y = x[:, -self.num_classes:, :]
-        gen_y = _1Ddownsample(gen_y.permute(2, 1, 0), H //
-                              self.window_size).permute(2, 1, 0)
-        # x = x.view(-1, self.window_size, self.window_size, C)
-        x = window_reverse(x[:, :-self.num_classes, :], self.window_size, H).view(
+        x = window_reverse(x, self.window_size, H).view(
             B, H, C)
+        # print("x shape at end of gen", x.shape)
 
         output = self.deconv(x)
+        if self.logits:
+            # print("act")
+            return output.permute(0, 2, 1)
+            # output = self.out_act(output)
+
         return self.out_act(output.permute(0, 2, 1))
 
 
@@ -644,8 +602,7 @@ def _1Ddownsample(x, scale_factor=4):
 
 class DisBlock(nn.Module):
 
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=leakyrelu, norm_layer=nn.LayerNorm, separate=0, window_size=16):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0., drop_path=0., act_layer=leakyrelu, norm_layer=nn.LayerNorm, separate=0, window_size=16):
         super().__init__()
         self.norm1 = CustomNorm(norm_layer, dim)
         self.attn = Attention(
@@ -667,9 +624,7 @@ class DisBlock(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, args, img_size=32, patch_size=None, in_chans=3, num_classes=1, embed_dim=None, depth=7,
-                 num_heads=4, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm):
+    def __init__(self, args, img_size=32, patch_size=None, in_chans=3, num_classes=1, embed_dim=None, depth=7, num_heads=4, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm):
         super().__init__()
         self.num_classes = args.num_classes
         self.num_features = embed_dim = self.embed_dim = args.df_dim
@@ -721,37 +676,26 @@ class Discriminator(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks_1 = nn.ModuleList([
             DisBlock(
-                dim=embed_dim//8, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, act_layer=act_layer, norm_layer=norm_layer,
-                window_size=self.window_size)
+                dim=embed_dim//8, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, act_layer=act_layer, norm_layer=norm_layer, window_size=self.window_size)
             for i in range(depth+1)])
         self.blocks_2 = nn.ModuleList([
-            DisBlock(
-                dim=embed_dim//4, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, act_layer=act_layer, norm_layer=norm_layer,
-                window_size=0)
+            DisBlock(dim=embed_dim//4, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, act_layer=act_layer, norm_layer=norm_layer, window_size=0)
             for i in range(depth)])
         self.blocks_3 = nn.ModuleList([
-            DisBlock(
-                dim=embed_dim//2, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, act_layer=act_layer, norm_layer=norm_layer,
-                window_size=0)
+            DisBlock(dim=embed_dim//2, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, act_layer=act_layer, norm_layer=norm_layer, window_size=0)
             for i in range(depth)])
         self.blocks_4 = nn.ModuleList([
-            DisBlock(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, act_layer=act_layer, norm_layer=norm_layer,
-                window_size=0)
+            DisBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                     drop=drop_rate, attn_drop=attn_drop_rate, drop_path=0, act_layer=act_layer, norm_layer=norm_layer, window_size=0)
             for i in range(depth)])
         self.last_block = nn.Sequential(
             #             Block(
             #                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
             #                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[0], norm_layer=norm_layer),
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[
-                    0], act_layer=act_layer, norm_layer=norm_layer,
-                window_size=0)
+            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                  attn_drop=attn_drop_rate, drop_path=dpr[0], act_layer=act_layer, norm_layer=norm_layer, window_size=0)
         )
 
         self.norm = CustomNorm(norm_layer, embed_dim)
@@ -848,9 +792,9 @@ class Discriminator(nn.Module):
 
     def forward(self, x, features=False):
         x = self.forward_features(x)
+        output = self.head(x)
+        output = self.activation(output)
         if features:
-            return x
-
-        x = self.head(x)
-        x = self.activation(x)
-        return x
+            # print("features")
+            return output, x
+        return output
